@@ -1,0 +1,82 @@
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+packages:
+ - wireguard
+ - net-tools
+ - qrencode
+
+write_files:
+  # Create Wireguard config file
+  # NOTE: private key will be created and set by runcmd
+  - path: /etc/wireguard/wg0.conf
+    owner: root:root
+    permissions: "0600"
+    content: |
+      [Interface]
+      Address = 10.1.1.1/24
+      ListenPort = 51820
+      PrivateKey = WG_SRV_PRI
+      PostUp = /etc/wireguard/postup.sh
+      PreDown = /etc/wireguard/predown.sh
+      SaveConfig = true
+
+      [Peer]
+      PublicKey = FIRSTCLIENT_PUB
+      AllowedIPs = 10.1.1.2/32
+  # Add WireGuard postup and predown scripts
+  - path: /etc/wireguard/postup.sh
+    owner: root:root
+    permissions: "0700"
+    append: true
+    content: |
+      ufw route allow in on wg0 out on eth0
+      iptables -t nat -I POSTROUTING -o eth0 -j MASQUERADE
+  - path: /etc/wireguard/predown.sh
+    owner: root:root
+    permissions: "0700"
+    append: true
+    content: |
+      ufw route delete allow in on wg0 out on eth0
+      iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+  
+  # Create first client config
+  - path: /etc/wireguard/10.1.1.2.conf
+    owner: root:root
+    permissions: "0600"
+    content: |
+      [Interface]
+      PrivateKey = WG_CLIENT_PRIV
+      Address = 10.1.1.2/24
+      DNS = 8.8.8.8
+
+      [Peer]
+      PublicKey = WG_SRV_PUB
+      AllowedIPs = 0.0.0.0/0
+      Endpoint = ${public_ip}:51820
+      PersistentKeepalive = 15
+
+# Setup Wireguard config and start
+runcmd:
+  # Setup firewall, just in case cloud provider firewall fails/is disabled
+  - sudo ufw allow 22/tcp
+  - sudo ufw allow 51820/udp
+  - sudo ufw enable
+  # Enable IP Forwarding
+  - sudo bash -c "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf && sysctl -p"
+  # Setup wg private key
+  - sudo bash -c "wg genkey > /etc/wireguard/private.key && chmod go= /etc/wireguard/private.key"
+  - sudo bash -c 'WG_PRI=$(cat /etc/wireguard/private.key); sed -i "s@WG_SRV_PRI@$WG_PRI@g" /etc/wireguard/wg0.conf'
+  # Write out wg public key
+  - sudo bash -c "cat /etc/wireguard/private.key | wg pubkey > /etc/wireguard/public.key && chmod go= /etc/wireguard/public.key"
+  # Populate initial client config keys
+  - sudo bash -c "wg genkey > /etc/wireguard/10.1.1.2_private.key && chmod go= /etc/wireguard/10.1.1.2_private.key"
+  - sudo bash -c "cat /etc/wireguard/10.1.1.2_private.key | wg pubkey > /etc/wireguard/10.1.1.2_public.key && chmod go= /etc/wireguard/10.1.1.2_public.key"
+  - sudo bash -c 'CLIENT_PRI=$(cat /etc/wireguard/10.1.1.2_private.key); sed -i "s@WG_CLIENT_PRIV@$CLIENT_PRI@g" /etc/wireguard/10.1.1.2.conf'
+  - sudo bash -c 'WG_PUB=$(cat /etc/wireguard/public.key); sed -i "s@WG_SRV_PUB@$WG_PUB@g" /etc/wireguard/10.1.1.2.conf'
+  - sudo bash -c 'CLIENT_PUB=$(cat /etc/wireguard/10.1.1.2_public.key); sed -i "s@FIRSTCLIENT_PUB@$CLIENT_PUB@g" /etc/wireguard/wg0.conf'
+  # Setup wireguard service
+  - sudo systemctl enable wg-quick@wg0.service
+  - sudo systemctl start wg-quick@wg0.service
